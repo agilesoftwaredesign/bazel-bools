@@ -9,6 +9,7 @@ import unittest
 import argparse
 import re
 import logging
+import time
 
 IGNORE_INCLUDES = ['cstdint', 'map', 'vector', 'string', 'memory', 'unordered_map', 'stdexcept', 'set', 'queue',
                    'limits', 'sstream', 'numeric', 'tuple', 'array']  # for speed-up and tweaking
@@ -23,6 +24,8 @@ INCL_REGEX_B = re.compile(r'\s*includes\s*=')
 STRIP_INCL_REGEX_B = re.compile(r'\s*strip_include_prefix\s*=')
 INCL_PREFIX_REGEX_B = re.compile(r'\s*include_prefix\s*=')
 CLOSE_REGEX = re.compile(r'.*]\s*,')
+
+header_files_cache = {}
 
 LOGGER = logging.getLogger('fix-include-path')
 logging.basicConfig(format='%(asctime)s %(levelname)s: %(message)s', level=logging.ERROR)
@@ -68,13 +71,17 @@ class BazelPackageProcessor:
         self.build_package = build_package
 
     def process(self):
+        LOGGER.info(f'processing bazel package {self.build_package}')
+        print(f'processing bazel package {self.build_package.stripped_package_name()}')
         compile_command_files = Util.get_compile_commands_of_package(self.build_package)
+        package_file_count = 0
         for bazel_target_compile_command_file in compile_command_files:
             LOGGER.debug(
                 'process in bazel package ' + self.build_package.stripped_package_name() +
                 ' the compile command file: ' + bazel_target_compile_command_file)
-            p = BazelTargetProcessor(bazel_target_compile_command_file)
+            p = BazelTargetProcessor(bazel_target_compile_command_file, package_file_count)
             p.process()
+            package_file_count += p.get_file_count()
 
     def modify_build(self):
         with open(self.build_package.buildfile(), 'r') as fi:
@@ -95,33 +102,41 @@ class BazelPackageProcessor:
 
 
 class BazelTargetProcessor:
-    def __init__(self, compile_command_file):
+    def __init__(self, compile_command_file, file_count=0):
         self.file_candidates = None
         self.file_lookup_cache = None
         self.compile_command_file = compile_command_file
+        self.file_count = file_count
 
     def process(self):
+        LOGGER.info(f'processing target with compile command file {self.compile_command_file}')
         for j in self.compile_command_lines():
             self.process_file(j['file'])
 
     def process_file(self, filename):
         if not filename.endswith(PROCESS_ONLY_FILE_SUFFIX):
-            print('+ skipping ' + filename)
+            print('+ skipping (file suffix) ' + filename)
             return
         if not os.path.exists(filename):
             print('+ skip not existing file ' + filename)
             return
 
-        print('+ process: ' + filename)
+        self.file_count += 1
+        if (self.file_count % 1000) == 0:
+            print(f'+ process ({self.file_count}th file in this package): {filename}')
+
         temporary_filename = filename + '-'
-        # TODO need to shift this currently_processed_file into a context-like structure
+        # TODO it would be nicer, if we would avoid (not thread-safe) passing variable self.currently_processed_file
         self.currently_processed_file = filename
-        with open(filename, 'r') as fi:
+        with open(filename, 'r', encoding='utf-8', errors='ignore') as fi:
             new_content = Util.modify_include(fi.readlines(), self._file_lookup)
             with open(temporary_filename, 'w') as fo:
                 for line in new_content:
                     fo.write(line)
         os.replace(temporary_filename, filename)
+
+    def get_file_count(self):
+        return self.file_count
 
     def make_consistent_changes_to_dependent_files(self):
         raise Exception('not yet implemented')
@@ -130,6 +145,8 @@ class BazelTargetProcessor:
         if self.file_lookup_cache is not None:
             return
         list_of_folders_to_search_through = []
+        LOGGER.debug(f'building cache for {self.compile_command_file}')
+        start_time = time.time()
         for j in self.compile_command_lines():
             opts = Util.extract_include_path_manipulation_option(j['command'])
             incl_paths = Util.incl_options_to_paths(opts)
@@ -139,9 +156,11 @@ class BazelTargetProcessor:
                     list_of_folders_to_search_through.append(folder)
         of_all = self.list_of_all(list_of_folders_to_search_through)
 
-        # as start of python 3.7 dictonary is garateed to keep order
+        # as start of python 3.7 dictionary is guaranteed to keep order
         # (https://mail.python.org/pipermail/python-dev/2017-December/151283.html and https://stackoverflow.com/a/7961390)
         self.file_lookup_cache = list(dict.fromkeys(of_all))
+        end_time = time.time()
+        LOGGER.debug(f'time for building cache: {end_time - start_time} sec for {self.compile_command_file}')
         LOGGER.info(f'cache with {len(self.file_lookup_cache)} items')
 
     def _file_lookup(self, for_file):
@@ -182,19 +201,23 @@ class BazelTargetProcessor:
     def list_of_all(incl_paths):
         candidates = []
         for path in incl_paths:
+            if path in header_files_cache:
+                candidates.extend(header_files_cache[path].copy())
+                continue
+
             if path == 'bazel-out/k8-opt/bin':
                 # print(' false performance short cut')
                 continue
             # by using grep, we cover also the "with path" for_file case
             include_suffix_find_command = '-name ' + ' -o -name '.join(['"*' + i + '"' for i in INCLUDE_SUFFIXES])
-            cmd = f'find "{path}" {include_suffix_find_command} 2>/dev/null'
+            cmd = f'find "{path}" \\( {include_suffix_find_command} \\) -exec realpath {{}} \\; 2>/dev/null'
             with os.popen(cmd) as cmd_process:
                 x = cmd_process.readlines()
+            header_files_cache[path] = x.copy()
             candidates.extend(x)
         cand_set = []
         for c in candidates:
-            real_path_candidate = os.path.realpath(c.strip())
-            stripped = Util.strip_non_workspace_relative_prefix(real_path_candidate)
+            stripped = Util.strip_non_workspace_relative_prefix(c)
             cand_set.append(stripped)
         return cand_set
 
@@ -288,6 +311,7 @@ class Util:
 
     @staticmethod
     def strip_non_workspace_relative_prefix(path):
+        path = path.strip()
         for ignore in KEEP_AFTER_INCLUDE_PREFIX:
             pos = path.find(ignore)
             if pos > -1:
@@ -463,6 +487,12 @@ class BazelFileTargetTest(unittest.TestCase):
         self.assertRaises(Exception, x.get_workspace_related_file)
 
 
+class BazelTargetProcessorTest(unittest.TestCase):
+    def test01(self):
+        x = BazelTargetProcessor.list_of_all(['ci_config', 'application/adp'])
+        self.assertEqual(8964, len(x))
+
+
 class BazelPackageNameTest(unittest.TestCase):
     def __init__(self, *args, **kwargs):
         super(BazelPackageNameTest, self).__init__(*args, **kwargs)
@@ -497,7 +527,6 @@ def process_package(bazel_package, arguments):
         print('skip package', bazel_package)
         return
     bazel_package = BazelPackageName('//' + bazel_package)
-    print('process package', bazel_package.stripped_package_name())
     p = BazelPackageProcessor(bazel_package)
     if not arguments.no_fix_includes:
         p.process()
@@ -516,18 +545,24 @@ if __name__ == "__main__":
     parser.add_argument('--log', help='set log level')
     # parser.add_argument('--compilecommands', help='compile commands of all packages in one JSON',
     #                    default='./compile_commands.json')
+    parser.add_argument('--quicktest', action="store_true")
     args = parser.parse_args()
-
-    if len(args.bazeltarget) == 0 and not args.pipe and not args.allpackages:
-        parser.print_help()
-        sys.exit(1)
-    assert (os.path.exists('WORKSPACE'))
 
     if args.log:
         numeric_level = getattr(logging, args.log.upper(), None)
         if not isinstance(numeric_level, int):
             raise ValueError('Invalid log level: %s' % args.log)
         logging.getLogger('').setLevel(numeric_level)
+
+    if args.quicktest:
+        t = BazelTargetProcessorTest()
+        t.test01()
+        sys.exit(0)
+
+    if len(args.bazeltarget) == 0 and not args.pipe and not args.allpackages:
+        parser.print_help()
+        sys.exit(1)
+    assert (os.path.exists('WORKSPACE'))
 
     if args.pipe:
         for line in sys.stdin:
